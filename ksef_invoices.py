@@ -13,7 +13,6 @@ import logging
 import time
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
-
 import requests
 
 logger = logging.getLogger(__name__)
@@ -22,7 +21,7 @@ logger = logging.getLogger(__name__)
 SLEEP_BETWEEN_WINDOWS = 185  # s
 
 SUBJECT_TYPE_LABELS = {
-    "Subject1": "Wystawione (sprzedaż)",
+    "Subject1": "Wystawione (sprzedaż)",  
     "Subject2": "Otrzymane (zakupy/koszty)",
 }
 
@@ -32,6 +31,8 @@ class KSeFInvoiceError(Exception):
 
 
 class KSeFInvoices:
+
+    MAX_OFFSET = 10000
 
     def __init__(self, base_url: str, auth_headers: dict, page_size: int = 100, auth=None):
         self.base_url = base_url
@@ -100,7 +101,8 @@ class KSeFInvoices:
                 inv["_typ"] = label
 
             all_invoices.extend(invoices)
-            offset += len(invoices)
+            # offset += len(invoices) 
+            offset += self.page_size #dla bezpiecznieństwa (API używa pageOffset a nie liczby zwróconych rekordów więc możliwe pominięcie faktury)
 
             # KSeF API 2.0: paginacja przez hasMore (nie totalCount)
             if not data.get("hasMore", False):
@@ -109,6 +111,83 @@ class KSeFInvoices:
             time.sleep(0.3)  # między stronami paginacji (limit 8 req/s jest OK)
 
         return all_invoices
+    
+    def fetch_windows_hours(self, subject_type, date_from, date_to):
+        """jeżeli w danym dniu liczba faktur przekroczy limit 10k
+          to dzieli je na coraz mniejsze zakresy godzinowe :2 """
+        try:
+            return self._fetch_window(subject_type,date_from,date_to)
+        
+        except KSeFInvoiceError as e: 
+            if "10 000" not in str(e) and "Window too large" not in str(e):
+                raise
+        
+            dt_from= datetime.strptime(date_from[:19], "%Y-%m-%dT%H:%M:%S")
+            dt_to= datetime.strptime(date_to[:19], "%Y-%m-%dT%H:%M:%S")
+
+            WINDOW_STEPS= [24,12,6,1] # fallback na wypadek gdyby dziennie było więcej niż 10k faktur na daną firmę 
+
+            all_invoices=[]
+            current=dt_from
+
+            while current< dt_to:
+                succes=False
+                for step in WINDOW_STEPS: 
+                    candidate_end=min(current + timedelta(hours=step), dt_to)
+                    win_from= self.to_iso(current,end_of_day=False)
+                    win_to = self.to_iso(candidate_end,end_of_day=True)
+
+                    try:
+                        invoices=self._fetch_window(subject_type,win_from,win_to)
+                        if len(invoices) >=self.MAX_OFFSET:
+                            raise KSeFInvoiceError("Window too large")
+                        
+                        logger.info(f"okno {win_from[:19]} -> {win_to[:19]}" f"({len(invoices)} faktur)")
+
+                        all_invoices.extend(invoices)
+                        current=candidate_end
+                        succes=True
+                        break
+                    except KSeFInvoiceError as e:
+
+                        if "10 000" not in str(e) and "Window too large" not in str(e):
+                            raise
+
+                        logger.warning(f"za dużo faktur w oknie {win_from[:19]} -> {win_to[:19]}")
+
+                if not succes:
+                    raise KSeFInvoiceError(f"Nie można zmiejszyć okna poniżej 1h: {current}")
+            
+            return all_invoices
+
+
+    def _fetch_by_splitting(self, subject_type, date_from, date_to):
+        """Rekurencyjne dzielenie zakresu dni na pół. tylko jeśli ilość faktur w zakresie >10k."""
+        try:
+
+            return self._fetch_window(subject_type, date_from, date_to)
+            
+        except KSeFInvoiceError as e:
+            if "10 000" not in str(e) and "Window too large" not in str(e):
+                raise
+            
+
+            logger.warning(f"przekroczono limit 10k. {date_from[:10]} - {date_to[:10]} stosuję podział na mniejsze okna.")
+            dt_from = datetime.strptime(date_from[:10], "%Y-%m-%d")
+            dt_to   = datetime.strptime(date_to[:10],   "%Y-%m-%d")
+            
+            if dt_from == dt_to:
+                # awaryjny fallback, zmiana na tryb godzinowy
+                logger.warning(f"Dzień {date_from[:10]} ma > 10k faktur. Przełączam na tryb godzinowy.")
+                return self._fetch_by_hours(subject_type, date_from, date_to)
+
+           
+            mid = dt_from + (dt_to - dt_from) // 2
+            left_to = self.to_iso(mid, end_of_day=True)
+            right_from = self.to_iso(mid + timedelta(days=1), end_of_day=False)
+            
+            return self._fetch_by_splitting(subject_type, date_from, left_to) + \
+                   self._fetch_by_splitting(subject_type, right_from, date_to)
 
     @staticmethod
     def _count_windows(dt_from: datetime, dt_to: datetime) -> int:
@@ -120,7 +199,7 @@ class KSeFInvoices:
             start = end + timedelta(days=1)
         return count
 
-    def fetch_all(self, subject_type: str, date_from: str, date_to: str) -> list[dict]:
+    def fetch_all(self, subject_type: str, date_from: str, date_to: str, auto_mode: bool=True) -> list[dict]:
         """
         Pobiera wszystkie faktury w zakresie dat, automatycznie dzieląc
         na okna 3-miesięczne (limit API: 20 req/h).
@@ -152,7 +231,11 @@ class KSeFInvoices:
             w_from = self.to_iso(window_start.date(), end_of_day=False)
             w_to   = self.to_iso(window_end.date(),   end_of_day=True)
 
-            batch = self._fetch_window(subject_type, w_from, w_to)
+            if auto_mode:
+                batch = self.fetch_windows_hours(subject_type, w_from, w_to)
+            else:
+                batch=self._fetch_by_splitting(subject_type,w_from,w_to)
+                
             all_invoices.extend(batch)
 
             window_start = window_end + timedelta(days=1)
@@ -168,6 +251,7 @@ class KSeFInvoices:
 
         logger.info(f"✓ Łącznie pobrano: {len(all_invoices)} faktur ({label})")
         return all_invoices
+
 
     @staticmethod
     def to_iso(d: str | date | datetime, end_of_day: bool = False) -> str:

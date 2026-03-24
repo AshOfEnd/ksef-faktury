@@ -41,14 +41,14 @@ class KSeFAuth:
         resp = requests.get(url, headers=HEADERS, timeout=30)
         self._raise_for_status(resp, "Błąd pobierania klucza publicznego")
         data = resp.json()
-        logger.info(f"Klucz publiczny RAW: {str(data)[:400]}")
+        # logger.info(f"Klucz publiczny RAW: {str(data)[:400]}")
 
         certificates = data if isinstance(data, list) else data.get("certificates", [])
         if not certificates:
             raise KSeFAuthError("Brak certyfikatów w odpowiedzi KSeF")
 
         first = certificates[0]
-        logger.info(f"Klucz — dostępne pola: {list(first.keys())}")
+        # logger.info(f"Klucz — dostępne pola: {list(first.keys())}")
         der_b64 = first.get("certificate") or first.get("value") or first.get("publicKey") or ""
         if not der_b64:
             raise KSeFAuthError(f"Brak danych certyfikatu. Pola: {list(first.keys())}")
@@ -59,7 +59,7 @@ class KSeFAuth:
         resp = requests.post(url, json={}, headers=HEADERS, timeout=30)
         self._raise_for_status(resp, "Błąd pobierania challenge")
         data = resp.json()
-        logger.info(f"Challenge RAW: {data}")
+        # logger.info(f"Challenge RAW: {data}")
         return data
 
     def _encrypt_token(self, public_key_der: bytes, timestamp_ms: int) -> str:
@@ -90,7 +90,7 @@ class KSeFAuth:
         resp = requests.post(url, json=body, headers=HEADERS, timeout=30)
         self._raise_for_status(resp, "Błąd wysyłania tokena KSeF")
         data = resp.json()
-        logger.info(f"SendKsefToken RAW: {data}")
+        # logger.info(f"SendKsefToken RAW: {data}")
         return data
 
     def _wait_for_auth(self, reference_number: str, auth_token: str,
@@ -100,7 +100,7 @@ class KSeFAuth:
 
         for attempt in range(1, max_retries + 1):
             resp = requests.get(url, headers=bearer_headers, timeout=30)
-            logger.info(f"Auth HTTP {resp.status_code} (próba {attempt}): {resp.text[:300]}")
+            # logger.info(f"Auth HTTP {resp.status_code} (próba {attempt}): {resp.text[:300]}")
 
             if resp.status_code == 200:
                 data = resp.json()
@@ -117,7 +117,7 @@ class KSeFAuth:
                     raise KSeFAuthError(
                         f"Uwierzytelnienie odrzucone (kod {status_code}): {desc} | {details}"
                     )
-                logger.info(f"Auth w toku, status={status_code} (próba {attempt})...")
+                # logger.info(f"Auth w toku, status={status_code} (próba {attempt})...")
 
             elif resp.status_code == 202:
                 logger.info(f"Auth w toku HTTP 202 (próba {attempt})...")
@@ -132,7 +132,7 @@ class KSeFAuth:
         resp = requests.post(url, json={}, headers=bearer_headers, timeout=30)
         self._raise_for_status(resp, "Błąd wymiany tokena na accessToken")
         data = resp.json()
-        logger.info(f"Redeem RAW: {str(data)[:300]}")
+        # logger.info(f"Redeem RAW: {str(data)[:300]}")
         return data
 
     def authenticate(self) -> str:
@@ -141,7 +141,7 @@ class KSeFAuth:
 
         logger.info("Krok 2/6: Pobieranie challenge...")
         challenge_resp = self._get_challenge()
-        logger.info(f"Challenge klucze: {list(challenge_resp.keys())}")
+        # logger.info(f"Challenge klucze: {list(challenge_resp.keys())}")
 
         challenge_id = (
             challenge_resp.get("challenge")
@@ -156,7 +156,7 @@ class KSeFAuth:
             or challenge_resp.get("timestamp")
             or int(time.time() * 1000)
         )
-        logger.info(f"challenge={challenge_id} | timestampMs={timestamp_ms}")
+        # logger.info(f"challenge={challenge_id} | timestampMs={timestamp_ms}")
 
         logger.info("Krok 3/6: Szyfrowanie tokena KSeF (RSA-OAEP SHA-256)...")
         encrypted_token = self._encrypt_token(public_key_der, timestamp_ms)

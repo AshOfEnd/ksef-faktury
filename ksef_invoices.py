@@ -9,11 +9,16 @@ Skrypt automatycznie dzieli długi zakres na okna 3-miesięczne i czeka
 185 s między oknami, aby zmieścić się w limicie 20 req/h.
 """
 
+import json
 import logging
 import time
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
 import requests
+import io, zipfile, time
+import xml.etree.ElementTree as ET
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +39,172 @@ class KSeFInvoices:
 
     MAX_OFFSET = 10000
 
-    def __init__(self, base_url: str, auth_headers: dict, page_size: int = 100, auth=None):
+    def __init__(self, base_url: str, auth_headers: dict, page_size: int = 100, auth=None,logger_base=None,logger_exports=None):
         self.base_url = base_url
         self.auth_headers = auth_headers
         self.page_size = min(max(page_size, 1), 1000)
         self.auth = auth  # KSeFAuth — do auto-odświeżenia tokena przy 401
+        self.logger_base=logger_base
+        self.logger_exports=logger_exports
+
+
+
+    def _initiate_export(self, subject_type: str, date_from: str, date_to: str) -> str:
+        url = f"{self.base_url}/invoices/exports"
+        enc_payload, aes_key, iv = self.auth.get_export_encryption_payload()
+        self._last_aes_key = aes_key
+        self._last_iv = iv
+        
+        body = {
+            "encryption": enc_payload,
+            "onlyMetadata": True,
+            "filters": {
+                "subjectType": subject_type,
+                "dateRange": {
+                    "dateType": "PermanentStorage",
+                    "from": date_from,
+                    "to": date_to
+                }
+            }
+        }
+
+        resp = requests.post(url, json=body, headers=self.auth_headers, timeout=60)
+        
+        
+        if resp.status_code != 201:
+            self.logger_exports.error(f"Błąd KSeF {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
+
+        data = resp.json()
+        token = data.get("referenceNumber")
+        
+        if not token:
+            self.logger_exports.error(f"KSeF nie zwrócił tokena! Odpowiedź: {data}")
+            raise KSeFInvoiceError("Brak acquisitionToken w odpowiedzi KSeF")
+
+        self.logger_exports.info(f"Zlecono eksport, token: {token}")
+        return token
+
+
+    def _wait_for_export_ready(self, token: str) -> dict:
+        url = f"{self.base_url}/invoices/exports/{token}"
+        # 120 prób co 30s = 1 godzina czekania
+        max_attempts = 120
+        interval = 30
+        
+        for attempt in range(1, max_attempts + 1):
+            resp = requests.get(url, headers=self.auth_headers, timeout=30)
+            self._raise_for_status(resp, "Błąd sprawdzania statusu eksportu")
+
+            data = resp.json()
+            status = data.get("status", {}).get("code")
+
+            if status == 200:
+                self.logger_exports.info(f"Eksport {token} gotowy!")
+                return data
+
+            if status == 105:
+                raise KSeFInvoiceError(f"Błąd eksportu (105): {data}")
+
+            self.logger_exports.info(f"Export {token} w toku [{attempt}/{max_attempts}] (status: {status})")
+            time.sleep(interval)
+
+        raise KSeFInvoiceError(f"Timeout eksportu po 1h dla tokena {token}")
+
+    
+    def _download_metadata_file(self, export_data: dict) -> list[dict]:
+       
+        parts = export_data.get("package", {}).get("parts", [])
+        if not parts:
+            self.logger_exports.info("Brak faktur w tej paczce, zwracamy pustą listę")
+            return []
+
+        all_metadata = []
+
+        for part in parts:
+            url = part.get("url")
+            resp = requests.get(url, timeout=120)
+            self._raise_for_status(resp, "Błąd pobierania binarnej paczki")
+
+            # Deszyfrowanie AES-256-CBC Twoim kluczem i IV
+            cipher = Cipher(algorithms.AES(self._last_aes_key), modes.CBC(self._last_iv))
+            decryptor = cipher.decryptor()
+            decrypted_padded = decryptor.update(resp.content) + decryptor.finalize()
+            
+            # Zdjęcie paddingu PKCS7
+            unpadder = padding.PKCS7(128).unpadder()
+            decrypted_zip = unpadder.update(decrypted_padded) + unpadder.finalize()
+
+
+            # Rozpakowanie ZIP i zamiana XML na listę słowników
+            
+            with zipfile.ZipFile(io.BytesIO(decrypted_zip)) as z:
+                for file_name in z.namelist():
+                    with z.open(file_name) as f:
+                        raw_content = f.read()
+                        self.logger_exports.info(f"Pobrano plik: {file_name} ({len(raw_content)} bajtów)")
+
+                        # Skoro plik to _metadata.json, używamy json.loads
+                        if file_name.endswith('.json'):
+                            data = json.loads(raw_content)
+                            
+                            # KSeF w JSONie zazwyczaj ma listę faktur w polu 'invoices' lub 'invoiceList'
+                            # Sprawdź strukturę, ale najczęściej jest to lista obiektów:
+                            invoices = data.get("invoices") or data.get("invoiceList") or data
+                            
+                            if isinstance(invoices, list):
+                                for inv in invoices:
+                                    # Dodajemy surowy słownik do listy (Twoja baza to przemieli)
+                                    # Upewnij się tylko, że pole 'acquisitionDate' tam jest
+                                    all_metadata.append(inv)
+                            else:
+                                self.logger_exports.warning(f"Nieoczekiwana struktura JSON w {file_name}")
+                        
+                        elif file_name.endswith('.xml'):
+                            # Tutaj zostawiasz stary kod XML na wszelki wypadek
+                            pass 
+        return all_metadata
+    
+
+
+    def _fetch_exports_window(self, subject_type: str, date_from: str, date_to: str) -> tuple[list[dict], str]:
+        token = self._initiate_export(subject_type, date_from, date_to)
+        export_data = self._wait_for_export_ready(token)
+        metadata = self._download_metadata_file(export_data)
+
+        
+        if export_data.get("package", {}).get("isTruncated", False):
+            new_start = export_data.get("package", {}).get("lastPermanentStorageDate")
+            
+        else:
+            new_start = export_data.get("package", {}).get("permanentStorageHwmDate")
+
+        return metadata, new_start
+
+    
+
+    def fetch_all_exports(self, subject_type: str, date_from: str, date_to: str) -> list[dict]:
+        all_invoices = []
+        current_start = date_from
+
+        while current_start < date_to:
+            batch, new_start = self._fetch_exports_window(subject_type, current_start, date_to)
+            
+            if not batch:
+                break
+
+            all_invoices.extend(batch)
+            self.logger_exports.info(f"old:{current_start} -> {new_start} -> {date_to} ")
+            if not new_start:
+                break
+            
+            current_start = new_start
+            if new_start == current_start:
+                break
+            
+        return all_invoices
+
+
 
     def _query_page(self, subject_type: str, date_from: str, date_to: str,
                     page_offset: int) -> dict:
@@ -51,7 +217,7 @@ class KSeFInvoices:
         body = {
             "subjectType": subject_type,
             "dateRange": {
-                "dateType": "Invoicing",
+                "dateType": "Invoicing", #typ poboru daty aktualnie: Data przyjęcia faktury w systemie KSeF (do dalszego przetrwarzania)
                 "from": date_from,
                 "to": date_to,
             },
@@ -60,14 +226,14 @@ class KSeFInvoices:
             resp = requests.post(url, json=body, params=params, headers=self.auth_headers, timeout=60)
             if resp.status_code == 401 and self.auth is not None:
                 # Token wygasł — re-auth w miejscu, bez utraty postępu
-                logger.warning(f"accessToken wygasł (próba {attempt}/5) — ponowne uwierzytelnienie...")
+                self.logger_base.warning(f"accessToken wygasł (próba {attempt}/5) — ponowne uwierzytelnienie...")
                 self.auth.authenticate()
                 self.auth_headers = self.auth.get_auth_headers()
                 continue
             if resp.status_code == 429:
                 # Czytaj Retry-After z nagłówka HTTP (standard); fallback: 185 s
                 retry_after = int(resp.headers.get("Retry-After", SLEEP_BETWEEN_WINDOWS)) + 2
-                logger.warning(
+                self.logger_base.warning(
                     f"HTTP 429 — rate limit, czekam {retry_after}s "
                     f"(próba {attempt}/5)..."
                 )
@@ -92,7 +258,7 @@ class KSeFInvoices:
             invoices = data.get("invoices", [])  # KSeF API 2.0: pole "invoices"
 
             if invoices and offset == 0:
-                logger.info(f"  Okno {date_from[:10]}–{date_to[:10]}: znaleziono faktury ({label})")
+                self.logger_base.info(f"  Okno {date_from[:10]}–{date_to[:10]}: znaleziono faktury ({label})")
 
             if not invoices:
                 break
@@ -142,7 +308,7 @@ class KSeFInvoices:
                         if len(invoices) >=self.MAX_OFFSET:
                             raise KSeFInvoiceError("Window too large")
                         
-                        logger.info(f"okno {win_from[:19]} -> {win_to[:19]}" f"({len(invoices)} faktur)")
+                        self.logger_base.info(f"okno {win_from[:19]} -> {win_to[:19]}" f"({len(invoices)} faktur)")
 
                         all_invoices.extend(invoices)
                         current=candidate_end
@@ -153,7 +319,7 @@ class KSeFInvoices:
                         if "10 000" not in str(e) and "Window too large" not in str(e):
                             raise
 
-                        logger.warning(f"za dużo faktur w oknie {win_from[:19]} -> {win_to[:19]}")
+                        self.logger_base.warning(f"za dużo faktur w oknie {win_from[:19]} -> {win_to[:19]}")
 
                 if not succes:
                     raise KSeFInvoiceError(f"Nie można zmiejszyć okna poniżej 1h: {current}")
@@ -172,13 +338,13 @@ class KSeFInvoices:
                 raise
             
 
-            logger.warning(f"przekroczono limit 10k. {date_from[:10]} - {date_to[:10]} stosuję podział na mniejsze okna.")
+            self.logger_base.warning(f"przekroczono limit 10k. {date_from[:10]} - {date_to[:10]} stosuję podział na mniejsze okna.")
             dt_from = datetime.strptime(date_from[:10], "%Y-%m-%d")
             dt_to   = datetime.strptime(date_to[:10],   "%Y-%m-%d")
             
             if dt_from == dt_to:
                 # awaryjny fallback, zmiana na tryb godzinowy
-                logger.warning(f"Dzień {date_from[:10]} ma > 10k faktur. Przełączam na tryb godzinowy.")
+                self.logger_base.warning(f"Dzień {date_from[:10]} ma > 10k faktur. Przełączam na tryb godzinowy.")
                 return self._fetch_by_hours(subject_type, date_from, date_to)
 
            
@@ -213,8 +379,8 @@ class KSeFInvoices:
         total_windows = self._count_windows(dt_from, dt_to)
         eta_min = (total_windows * SLEEP_BETWEEN_WINDOWS) // 60
 
-        logger.info(f"Pobieranie faktur: {label}")
-        logger.info(
+        self.logger_base.info(f"Pobieranie faktur: {label}")
+        self.logger_base.info(
             f"Zakres: {date_from[:10]} → {date_to[:10]} | "
             f"{total_windows} okien 3-miesięcznych | "
             f"szac. czas: ~{eta_min} min"
@@ -243,13 +409,13 @@ class KSeFInvoices:
             if window_start <= dt_to:
                 remaining_windows = total_windows - window_num
                 remaining_min     = (remaining_windows * SLEEP_BETWEEN_WINDOWS) // 60
-                logger.info(
+                self.logger_base.info(
                     f"  [{window_num}/{total_windows}] Czekam {SLEEP_BETWEEN_WINDOWS}s "
                     f"(limit 20 req/h) — pozostało ~{remaining_min} min..."
                 )
                 time.sleep(SLEEP_BETWEEN_WINDOWS)
 
-        logger.info(f"✓ Łącznie pobrano: {len(all_invoices)} faktur ({label})")
+        self.logger_base.info(f"✓ Łącznie pobrano: {len(all_invoices)} faktur ({label})")
         return all_invoices
 
 

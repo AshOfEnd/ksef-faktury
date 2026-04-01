@@ -3,6 +3,7 @@ ksef_auth.py - KSeF API 2.0 - uwierzytelnienie Tokenem KSeF
 """
 
 import base64
+import os
 import time
 import logging
 
@@ -46,13 +47,33 @@ class KSeFAuth:
         certificates = data if isinstance(data, list) else data.get("certificates", [])
         if not certificates:
             raise KSeFAuthError("Brak certyfikatów w odpowiedzi KSeF")
-
+        
         first = certificates[0]
         # logger.info(f"Klucz — dostępne pola: {list(first.keys())}")
         der_b64 = first.get("certificate") or first.get("value") or first.get("publicKey") or ""
         if not der_b64:
             raise KSeFAuthError(f"Brak danych certyfikatu. Pola: {list(first.keys())}")
+        
         return base64.b64decode(der_b64)
+    
+    def _get_public_symetric_key(self) -> bytes:
+            url = f"{self.base_url}/security/public-key-certificates"
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            self._raise_for_status(resp, "Błąd pobierania klucza publicznego")
+            data = resp.json()
+            # logger.info(f"Klucz publiczny RAW: {str(data)[:400]}")
+
+            certificates = data if isinstance(data, list) else data.get("certificates", [])
+            if not certificates:
+                raise KSeFAuthError("Brak certyfikatów w odpowiedzi KSeF")
+            
+            first = certificates[1]
+            # logger.info(f"Klucz — dostępne pola: {list(first.keys())}")
+            der_b64 = first.get("certificate") or first.get("value") or first.get("publicKey") or ""
+            if not der_b64:
+                raise KSeFAuthError(f"Brak danych certyfikatu. Pola: {list(first.keys())}")
+            
+            return base64.b64decode(der_b64)
 
     def _get_challenge(self) -> dict:
         url = f"{self.base_url}/auth/challenge"
@@ -218,6 +239,48 @@ class KSeFAuth:
             "Accept": "application/json",
             "Authorization": f"Bearer {self.access_token}",
         }
+    # Wewnątrz klasy KSeFAuth w ksef_auth.py:
+
+    def get_export_encryption_payload(self) -> tuple[dict, bytes, bytes]:
+        """
+        Generuje klucze sesji dla Eksportu i szyfruje klucz AES kluczem publicznym MF.
+        Zwraca: (payload_do_json, surowy_aes_key, surowy_iv)
+        """
+        # 1. Pobierz klucz publiczny MF (wykorzystuje Twoją istniejącą metodę)
+        public_key_der = self._get_public_symetric_key()
+        
+        # 2. Generuj losowe klucze sesji (AES-256)
+        aes_key = os.urandom(32) 
+        iv = os.urandom(16)
+        
+        # 3. Załaduj klucz publiczny RSA
+        try:
+            public_key = serialization.load_der_public_key(public_key_der)
+        except Exception:
+            from cryptography import x509
+            cert = x509.load_der_x509_certificate(public_key_der)
+            public_key = cert.public_key()
+
+        # 4. Szyfruj klucz AES (RSA-OAEP SHA-256)
+        encrypted_aes_key = public_key.encrypt(
+                aes_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                    )
+        )
+
+        # 5. Przygotuj strukturę JSON
+        encryption_payload = {
+    "encryptedSymmetricKey": base64.b64encode(encrypted_aes_key).decode('ascii'),
+    "initializationVector": base64.b64encode(iv).decode('ascii'),
+    "algorithm": "AES/CBC/PKCS7Padding",
+    "keyEncryptionAlgorithm": "RSA/ECB/OAEPWithSHA-256AndMGF1Padding"
+}
+        
+        return encryption_payload, aes_key, iv
+
 
     @staticmethod
     def _raise_for_status(resp: requests.Response, context: str) -> None:
